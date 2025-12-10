@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Envs
+.venv/
+env/
+venv/
+
+# Models and logs
+models/
+checkpoints/
+runs/
+*.pt
+*.pth
+*.ckpt
+
+# Misc
+*.log
