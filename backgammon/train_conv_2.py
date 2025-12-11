@@ -702,12 +702,38 @@ def _smoke_test_v2():
 
 
 if __name__ == "__main__":
-    # Optional: run the tiny one-game smoke test once
-    # _smoke_test_v2()
+    import argparse
 
-    print("[TRAIN-V2] Starting shaped TD(0) run (v2) for 1000 episodes (local smoke test)...")
+    parser = argparse.ArgumentParser(description="Train Conv TD(0) v2 for Backgammon")
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=TOTAL_EPISODES_V2,
+        help=f"Number of self-play episodes (default: {TOTAL_EPISODES_V2})",
+    )
+    parser.add_argument(
+        "--eval-interval",
+        type=int,
+        default=EVAL_INTERVAL_V2,
+        help=f"Evaluate vs random every N episodes (default: {EVAL_INTERVAL_V2})",
+    )
+    parser.add_argument(
+        "--eval-games",
+        type=int,
+        default=EVAL_NUM_GAMES_V2,
+        help=f"Number of games in each eval vs random (default: {EVAL_NUM_GAMES_V2})",
+    )
+
+    args = parser.parse_args()
+
+    print(
+        f"[TRAIN-V2] Starting shaped TD(0) run (v2)... "
+        f"episodes={args.episodes}, eval_interval={args.eval_interval}, "
+        f"eval_games={args.eval_games}"
+    )
+
     train_td0_conv_v2(
-        total_episodes=1_000,   # 1000-episode smoke run
-        eval_interval=1_000,    # evaluate once at the end
-        eval_num_games=100,     # lighter eval than 500 games
+        total_episodes=args.episodes,
+        eval_interval=args.eval_interval,
+        eval_num_games=args.eval_games,
     )
