@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Optional, List, Tuple
 from dataclasses import dataclass
 
+
 import os
 import numpy as np
 import time
@@ -16,6 +17,24 @@ from backgammon import (
     legal_moves,
 )
 # ^ same professor backgammon.py API as v1
+
+@dataclass
+class EnvState:
+    board: np.ndarray
+    player: int
+    done: bool = False
+    moves_in_episode: int = 0  # how many plies in the current game
+
+
+@dataclass
+class Transition:
+    board: np.ndarray
+    player: int
+    reward: float
+    next_board: np.ndarray
+    next_player: int
+    done: bool
+
 
 
 # ============================================================
@@ -265,8 +284,13 @@ def select_move_eps_greedy_v2(
     pts_t, g_t = encode_batch(cand_boards, next_players)
 
     # Run through the value network
+    was_training = net.training
+    net.eval()
     with torch.no_grad():
-        values = net(pts_t, g_t).cpu().numpy()  # (M,)
+        values = net(pts_t, g_t).cpu().numpy()
+    if was_training:
+        net.train()
+
 
     # We want to maximize our win chance.
     # Since values are from the NEXT player's viewpoint, "lower is better" for us.
@@ -353,6 +377,67 @@ def value_of_state_v2(
     return v.squeeze(0)                                      # scalar tensor
 
 
+
+
+def td0_update_batch(
+    net: ConvValueNetV2,
+    optimizer: optim.Optimizer,
+    transitions: list[Transition],
+    gamma: float,
+) -> float:
+    """
+    Perform one batched TD(0) update on a list of transitions.
+
+    Each transition i has:
+        s_i  = (board, player)
+        r_i  = reward
+        s'_i = (next_board, next_player)
+        done_i
+
+    Target: r_i  if done_i else r_i + gamma * V(s'_i).
+    Loss:   mean_i (V(s_i) - target_i)^2
+    """
+    if not transitions:
+        return 0.0
+
+    # --- Pack batch ---
+    boards = np.stack([t.board for t in transitions], axis=0)      # (B, 29)
+    players = np.array([t.player for t in transitions], dtype=np.int32)  # (B,)
+    next_boards = np.stack([t.next_board for t in transitions], axis=0)  # (B, 29)
+    next_players = np.array([t.next_player for t in transitions], dtype=np.int32)  # (B,)
+    rewards = torch.tensor([t.reward for t in transitions], dtype=torch.float32, device=DEVICE)  # (B,)
+    dones_np = np.array([t.done for t in transitions], dtype=bool)      # (B,)
+
+    # --- V(s) ---
+    pts_s, g_s = encode_batch(boards, players)   # (B, C, 24), (B, G)
+    v_s = net(pts_s, g_s).view(-1)               # (B,)
+
+    # --- TD targets ---
+    targets = rewards.clone()                    # start with r_i
+
+    if not np.all(dones_np):
+        # Compute V(s') only for non-terminal transitions
+        not_done_idx = np.where(~dones_np)[0]
+        nb = next_boards[not_done_idx]          # (B_nd, 29)
+        np_players = next_players[not_done_idx] # (B_nd,)
+
+        pts_sp, g_sp = encode_batch(nb, np_players)
+        with torch.no_grad():
+            v_next = net(pts_sp, g_sp).view(-1)  # (B_nd,)
+
+        targets_nd = rewards[not_done_idx] + gamma * v_next
+        targets[not_done_idx] = targets_nd
+
+    # --- MSE loss over batch ---
+    loss = (v_s - targets).pow(2).mean()
+
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+    optimizer.step()
+
+    return float(loss.item())
+
 # ============================================================
 # One shaped TD(0) self-play episode
 # ============================================================
@@ -407,9 +492,16 @@ def play_and_train_shaped_td0_episode_v2(
 
         move_count += 1
 
+        # --- Optional hard cap on game length ---
+        if (not done) and move_count >= MAX_MOVES_PER_GAME_V2:
+            # Treat as a terminal "draw"/no-result: no +1, just shaped reward.
+            done = True
+            # terminal_reward stays 0.0
+
         # --- Dense shaped reward from s -> s' from current player's perspective ---
         shaped_r = shaped_positional_reward(s_board, next_board, s_player)
         reward = terminal_reward + shaped_r
+
 
         # --- TD(0) update: v(s) -> reward + gamma * v(s') ---
         v_s = value_of_state_v2(net, s_board, s_player)  # scalar tensor
@@ -520,8 +612,15 @@ def play_game_agent_vs_random_v2(
                 print(f"[VS-RAND-V2 GAME OVER] winner={player:+d}, total_moves={move_count}")
             return player
 
+        # --- Optional hard cap on game length in evaluation ---
+        if move_count >= MAX_MOVES_PER_GAME_V2:
+            if verbose:
+                print(f"[VS-RAND-V2] Max moves {MAX_MOVES_PER_GAME_V2} reached, treating as draw.")
+            return 0  # "draw" (counts as non-win in evaluate_vs_random_v2)
+
         board = next_board
         player = -player
+
 
 
 def evaluate_vs_random_v2(
@@ -562,6 +661,7 @@ E_START_V2          = 0.3
 E_END_V2            = 0.01
 GAMMA_V2            = 0.99
 LR_V2               = 1e-4
+MAX_MOVES_PER_GAME_V2 = 450
 
 EVAL_INTERVAL_V2    = 10_000      # evaluate vs random every N episodes
 EVAL_NUM_GAMES_V2   = 500         # games per evaluation
@@ -578,13 +678,17 @@ def train_td0_conv_v2(
     e_end: float = E_END_V2,
     eval_interval: int = EVAL_INTERVAL_V2,
     eval_num_games: int = EVAL_NUM_GAMES_V2,
+    n_envs: int = 8,
+    batch_size: int = 64,
+    max_buffer_size: int = 50_000,
 ) -> ConvValueNetV2:
     """
     Final v2 TD(0) training loop with:
-      - Online TD(0) self-play.
+      - Multiple self-play games in parallel (n_envs).
       - Shaped rewards on intermediate states.
-      - Epsilon annealing across the full training run.
+      - Epsilon annealing across the *completed* episodes.
       - Simple learning-rate schedule.
+      - Batched TD(0) updates over recent transitions.
       - Periodic evaluation vs a random baseline.
       - Checkpointing + CSV logging of eval history.
     """
@@ -597,21 +701,38 @@ def train_td0_conv_v2(
     np.random.seed(42)
     torch.manual_seed(42)
 
+    # --- Initialize parallel environments ---
+    envs: list[EnvState] = []
+    for _ in range(n_envs):
+        envs.append(
+            EnvState(
+                board=init_board().astype(np.int32),
+                player=1,
+                done=False,
+                moves_in_episode=0,
+            )
+        )
+
+    # --- TD(0) transition buffer ---
+    buffer: list[Transition] = []
+
     best_random_win = 0.0
     eval_history: list[tuple[int, float]] = []  # (episode, winrate_vs_random)
 
-    # --- NEW: cheap tracking for trust/logging ---
-    recent_moves = 0
+    episodes_done = 0
+    next_eval_at = eval_interval
+
+    # Logging helpers for "per 1k episodes"
+    last_log_ep = 0
+    moves_since_log = 0
     last_log_time = time.time()
 
-    for ep in range(1, total_episodes + 1):
-        # --- Linear epsilon decay over total_episodes ---
-        t = min(1.0, ep / float(total_episodes))
+    while episodes_done < total_episodes:
+        # --- Current epsilon + LR based on completed episodes ---
+        t = min(1.0, episodes_done / float(total_episodes))
         epsilon = e_start + t * (e_end - e_start)
 
-        # --- Simple LR schedule ---
-        # Keep LR high early, then decay at 60% and 85% of training.
-        frac = ep / float(total_episodes)
+        frac = episodes_done / float(total_episodes) if total_episodes > 0 else 1.0
         if frac > 0.85:
             lr_factor = 0.1
         elif frac > 0.60:
@@ -622,74 +743,137 @@ def train_td0_conv_v2(
         for g in optimizer.param_groups:
             g["lr"] = lr * lr_factor
 
-        # --- Play one shaped self-play game + online TD(0) updates ---
-        winner, moves = play_and_train_shaped_td0_episode_v2(
-            net=net,
-            optimizer=optimizer,
-            gamma=gamma,
-            epsilon=epsilon,
-            verbose=False,
-        )
+        # --- Step each environment once ---
+        for env in envs:
+            if episodes_done >= total_episodes:
+                break
 
-        # NEW: accumulate moves to build a 1k-episode average
-        recent_moves += moves
+            if env.done:
+                # Reset env for a new episode
+                env.board = init_board().astype(np.int32)
+                env.player = 1
+                env.done = False
+                env.moves_in_episode = 0
 
-        # Lightweight logging every 1k episodes
-        if ep % 1_000 == 0:
-            # Compute avg moves over last 1k episodes
-            avg_moves = recent_moves / 1000.0
-            recent_moves = 0
+            s_board = env.board.copy()
+            s_player = env.player
 
-            # Time spent on last 1k episodes
-            now = time.time()
-            elapsed = now - last_log_time
-            last_log_time = now
-
-            print(
-                f"[TRAIN-V2] ep={ep}, "
-                f"epsilon={epsilon:.4f}, "
-                f"lr={optimizer.param_groups[0]['lr']:.6g}, "
-                f"last_winner={winner:+d}, "
-                f"last_moves={moves}, "
-                f"avg_moves_1k={avg_moves:.1f}, "
-                f"time_1k={elapsed:.1f}s"
-            )
-
-        # --- Periodic evaluation vs random + checkpointing ---
-        if ep % eval_interval == 0:
-            print(
-                f"[TRAIN-V2] Evaluating vs random after ep={ep} "
-                f"({eval_num_games} games, greedy)..."
-            )
-            win_rate = evaluate_vs_random_v2(
+            # Choose move with epsilon-greedy policy using the same net
+            move, next_board, _ = select_move_eps_greedy_v2(
+                s_board,
+                s_player,
+                epsilon,
                 net,
-                num_games=eval_num_games,
-                epsilon_eval=0.0,
             )
 
-            # Track eval history for plotting later
-            eval_history.append((ep, float(win_rate)))
+            # Handle pass (no legal moves)
+            if move is None:
+                done = False
+                next_board = env.board  # unchanged
+                next_player = -env.player
+                terminal_reward = 0.0
+            else:
+                next_board = next_board.astype(np.int32)
+                done = game_over(next_board)
+                next_player = -env.player
+                terminal_reward = 1.0 if done else 0.0
 
-            # Save checkpoint for this episode
-            ckpt_path = os.path.join(
-                CHECKPOINT_DIR_V2,
-                f"{BASE_MODEL_NAME_V2}_ep{ep}.pt"
+            env.moves_in_episode += 1
+
+            # --- Optional hard cap on game length ---
+            if (not done) and env.moves_in_episode >= MAX_MOVES_PER_GAME_V2:
+                done = True
+                # terminal_reward stays 0.0 (no +1 reward for capped games)
+
+            # Dense shaped reward from s -> s' from current player's perspective
+            shaped_r = shaped_positional_reward(s_board, next_board, s_player)
+            reward = terminal_reward + shaped_r
+
+
+            # Store transition for later batched TD update
+            buffer.append(
+                Transition(
+                    board=s_board,
+                    player=s_player,
+                    reward=float(reward),
+                    next_board=next_board,
+                    next_player=next_player,
+                    done=done,
+                )
             )
-            torch.save(net.state_dict(), ckpt_path)
-            print(f"[CKPT-V2] Saved model to {ckpt_path}")
 
-            # Track best vs random so far
-            if win_rate > best_random_win:
-                best_random_win = win_rate
-                best_path = os.path.join(
-                    CHECKPOINT_DIR_V2,
-                    f"{BASE_MODEL_NAME_V2}_best_random.pt"
-                )
-                torch.save(net.state_dict(), best_path)
-                print(
-                    f"[CKPT-V2] New best vs random={win_rate:.3f}, "
-                    f"saved to {best_path}"
-                )
+            # Keep buffer from growing without bound
+            if len(buffer) > max_buffer_size:
+                # Drop oldest transitions
+                excess = len(buffer) - max_buffer_size
+                buffer = buffer[excess:]
+
+            # Update env state
+            env.board = next_board
+            env.player = next_player
+
+            # Episode finished?
+            if done:
+                episodes_done += 1
+                moves_since_log += env.moves_in_episode
+                env.done = True  # will be reset on next loop
+
+                # --- Logging every 1k episodes ---
+                if episodes_done % 1_000 == 0:
+                    now = time.time()
+                    elapsed_s = now - last_log_time
+
+                    avg_moves_1k = moves_since_log / 1_000.0
+                    print(
+                        f"[TRAIN-V2] ep={episodes_done}, "
+                        f"epsilon={epsilon:.4f}, "
+                        f"lr={optimizer.param_groups[0]['lr']:.6g}, "
+                        f"avg_moves_1k={avg_moves_1k:.1f}, "
+                        f"time_1k={elapsed_s:.1f}s"
+                    )
+
+                    moves_since_log = 0
+                    last_log_time = now
+
+                # --- Periodic evaluation vs random + checkpointing ---
+                if episodes_done >= next_eval_at:
+                    print(
+                        f"[TRAIN-V2] Evaluating vs random after ep={episodes_done} "
+                        f"({eval_num_games} games, greedy)..."
+                    )
+                    win_rate = evaluate_vs_random_v2(
+                        net,
+                        num_games=eval_num_games,
+                        epsilon_eval=0.0,
+                    )
+
+                    eval_history.append((episodes_done, float(win_rate)))
+
+                    ckpt_path = os.path.join(
+                        CHECKPOINT_DIR_V2,
+                        f"{BASE_MODEL_NAME_V2}_ep{episodes_done}.pt"
+                    )
+                    torch.save(net.state_dict(), ckpt_path)
+                    print(f"[CKPT-V2] Saved model to {ckpt_path}")
+
+                    if win_rate > best_random_win:
+                        best_random_win = win_rate
+                        best_path = os.path.join(
+                            CHECKPOINT_DIR_V2,
+                            f"{BASE_MODEL_NAME_V2}_best_random.pt"
+                        )
+                        torch.save(net.state_dict(), best_path)
+                        print(
+                            f"[CKPT-V2] New best vs random={win_rate:.3f}, "
+                            f"saved to {best_path}"
+                        )
+
+                    next_eval_at += eval_interval
+
+        # --- Batched TD(0) update when we have enough transitions ---
+        if len(buffer) >= batch_size:
+            batch = buffer[-batch_size:]  # use the most recent transitions
+            td0_update_batch(net, optimizer, batch, gamma=gamma)
 
     # --- Dump eval history to CSV for plotting v1 vs v2 ---
     history_path = os.path.join(
@@ -703,6 +887,7 @@ def train_td0_conv_v2(
     print(f"[LOG-V2] Saved eval history to {history_path}")
 
     return net
+
 
 
 
