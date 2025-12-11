@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import os
 import numpy as np
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -225,7 +226,7 @@ def select_move_eps_greedy_v2(
     player: int,
     epsilon: float,
     net: ConvValueNetV2,
-) -> tuple[Optional[np.ndarray], np.ndarray]:
+) -> tuple[Optional[np.ndarray], np.ndarray, Optional[float]]:
     """
     Choose a move for `player` on `board` via epsilon-greedy one-ply lookahead.
 
@@ -245,13 +246,13 @@ def select_move_eps_greedy_v2(
 
     # No legal moves: must pass
     if len(moves) == 0:
-        return None, board
+        return None, board, None
 
     # --- Exploration step ---
     # With probability epsilon, pick a random move regardless of value.
     if np.random.rand() < epsilon:
         idx = np.random.randint(len(moves))
-        return moves[idx], boards[idx]
+        return moves[idx], boards[idx], None
 
     # --- Exploitation step ---
     # Evaluate each successor board from the NEXT player's perspective.
@@ -264,14 +265,15 @@ def select_move_eps_greedy_v2(
     pts_t, g_t = encode_batch(cand_boards, next_players)
 
     # Run through the value network
-    net.eval()
     with torch.no_grad():
         values = net(pts_t, g_t).cpu().numpy()  # (M,)
 
     # We want to maximize our win chance.
     # Since values are from the NEXT player's viewpoint, "lower is better" for us.
     best_idx = int(values.argmin())
-    return moves[best_idx], boards[best_idx]
+    best_val = float(values[best_idx])
+
+    return moves[best_idx], boards[best_idx], best_val
 
 
 # ============================================================
@@ -280,14 +282,19 @@ def select_move_eps_greedy_v2(
 
 def _extract_global_counts(board: np.ndarray, player: int) -> tuple[float, float, float, float]:
     """
-    Convenience helper:
     From (board, player) get:
         my_bar, opp_bar, my_borne, opp_borne
-    as *unnormalized* counts (0..15).
+    as *unnormalized* counts (0..15), without going through encode_board_np.
     """
-    _, g = encode_board_np(board, player)  # g is normalized by /15.0
-    my_bar, opp_bar, my_borne, opp_borne = (g * 15.0).tolist()
-    return my_bar, opp_bar, my_borne, opp_borne
+    signed = board.astype(np.int32) * int(player)
+
+    my_bar    = max(signed[25], 0) + max(signed[26], 0)
+    opp_bar   = max(-signed[25], 0) + max(-signed[26], 0)
+    my_borne  = max(signed[27], 0) + max(signed[28], 0)
+    opp_borne = max(-signed[27], 0) + max(-signed[28], 0)
+
+    return float(my_bar), float(opp_bar), float(my_borne), float(opp_borne)
+
 
 
 def shaped_positional_reward(
@@ -381,7 +388,8 @@ def play_and_train_shaped_td0_episode_v2(
         s_player = player
 
         # --- Choose move with epsilon-greedy policy using the same net ---
-        move, next_board = select_move_eps_greedy_v2(board, player, epsilon, net)
+        move, next_board, v_next_from_policy = select_move_eps_greedy_v2(board, player, epsilon, net)
+
 
         # Handle pass (no legal moves)
         if move is None:
@@ -409,9 +417,15 @@ def play_and_train_shaped_td0_episode_v2(
         if done:
             target = torch.tensor(reward, dtype=torch.float32, device=DEVICE)
         else:
-            with torch.no_grad():
-                v_next = value_of_state_v2(net, next_board, next_player)
-                target = torch.tensor(reward, dtype=torch.float32, device=DEVICE) + gamma * v_next
+            # Reuse V(next_state) from move selection when available (greedy case).
+            if v_next_from_policy is not None:
+                v_next = torch.tensor(v_next_from_policy, dtype=torch.float32, device=DEVICE)
+            else:
+                # For exploratory (epsilon) moves, we still need to evaluate V(next_state).
+                with torch.no_grad():
+                    v_next = value_of_state_v2(net, next_board, next_player)
+        
+            target = torch.tensor(reward, dtype=torch.float32, device=DEVICE) + gamma * v_next
 
         loss = (v_s - target) ** 2
 
@@ -484,10 +498,11 @@ def play_game_agent_vs_random_v2(
 
         if player == 1:
             # our shaped agent
-            move, next_board = select_move_eps_greedy_v2(board, player, epsilon_eval, net)
+            move, next_board, _ = select_move_eps_greedy_v2(board, player, epsilon_eval, net)
         else:
             # random opponent
             move, next_board = select_move_random(board, player)
+        
 
         # Handle pass (no legal moves)
         if move is None:
@@ -514,18 +529,12 @@ def evaluate_vs_random_v2(
     num_games: int = 100,
     epsilon_eval: float = 0.0,
 ) -> float:
-    """
-    Evaluate the shaped TD(0) agent against the random baseline.
+    # 1) Remember current mode (train or eval)
+    was_training = net.training
 
-    Args:
-        net:          ConvValueNetV2
-        num_games:    number of evaluation games
-        epsilon_eval: epsilon used by the agent during evaluation
-                      (0.0 = purely greedy policy)
+    # 2) Switch to eval mode for stability (dropout off, etc.)
+    net.eval()
 
-    Returns:
-        win_rate: fraction of games the agent wins as player +1.
-    """
     wins = 0
     for _ in range(num_games):
         winner = play_game_agent_vs_random_v2(net, epsilon_eval=epsilon_eval, verbose=False)
@@ -534,7 +543,13 @@ def evaluate_vs_random_v2(
 
     win_rate = wins / float(num_games)
     print(f"[EVAL-V2] vs random over {num_games} games: win_rate={win_rate:.3f}")
+
+    # 3) Restore previous mode
+    if was_training:
+        net.train()
+
     return win_rate
+
 
 
 # ============================================================
@@ -585,6 +600,10 @@ def train_td0_conv_v2(
     best_random_win = 0.0
     eval_history: list[tuple[int, float]] = []  # (episode, winrate_vs_random)
 
+    # --- NEW: cheap tracking for trust/logging ---
+    recent_moves = 0
+    last_log_time = time.time()
+
     for ep in range(1, total_episodes + 1):
         # --- Linear epsilon decay over total_episodes ---
         t = min(1.0, ep / float(total_episodes))
@@ -612,14 +631,28 @@ def train_td0_conv_v2(
             verbose=False,
         )
 
+        # NEW: accumulate moves to build a 1k-episode average
+        recent_moves += moves
+
         # Lightweight logging every 1k episodes
         if ep % 1_000 == 0:
+            # Compute avg moves over last 1k episodes
+            avg_moves = recent_moves / 1000.0
+            recent_moves = 0
+
+            # Time spent on last 1k episodes
+            now = time.time()
+            elapsed = now - last_log_time
+            last_log_time = now
+
             print(
                 f"[TRAIN-V2] ep={ep}, "
                 f"epsilon={epsilon:.4f}, "
                 f"lr={optimizer.param_groups[0]['lr']:.6g}, "
                 f"last_winner={winner:+d}, "
-                f"last_moves={moves}"
+                f"last_moves={moves}, "
+                f"avg_moves_1k={avg_moves:.1f}, "
+                f"time_1k={elapsed:.1f}s"
             )
 
         # --- Periodic evaluation vs random + checkpointing ---
@@ -670,6 +703,7 @@ def train_td0_conv_v2(
     print(f"[LOG-V2] Saved eval history to {history_path}")
 
     return net
+
 
 
 
