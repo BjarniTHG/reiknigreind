@@ -666,8 +666,10 @@ MAX_MOVES_PER_GAME_V2 = 450
 EVAL_INTERVAL_V2    = 10_000      # evaluate vs random every N episodes
 EVAL_NUM_GAMES_V2   = 500         # games per evaluation
 
-CHECKPOINT_DIR_V2   = "models_v2"
-BASE_MODEL_NAME_V2  = "conv_td0_shaped_v2"
+CHECKPOINT_DIR_V2   = "models_v2_big"
+BASE_MODEL_NAME_V2  = "conv_td0_shaped_v2_big"
+
+UPDATES_PER_STEP = 3
 
 
 def train_td0_conv_v2(
@@ -678,8 +680,8 @@ def train_td0_conv_v2(
     e_end: float = E_END_V2,
     eval_interval: int = EVAL_INTERVAL_V2,
     eval_num_games: int = EVAL_NUM_GAMES_V2,
-    n_envs: int = 8,
-    batch_size: int = 64,
+    n_envs: int = 16,
+    batch_size: int = 128,
     max_buffer_size: int = 50_000,
 ) -> ConvValueNetV2:
     """
@@ -872,8 +874,10 @@ def train_td0_conv_v2(
 
         # --- Batched TD(0) update when we have enough transitions ---
         if len(buffer) >= batch_size:
-            batch = buffer[-batch_size:]  # use the most recent transitions
-            td0_update_batch(net, optimizer, batch, gamma=gamma)
+            for _ in range(UPDATES_PER_STEP):
+                idx = np.random.choice(len(buffer), size=batch_size, replace=False)
+                batch = [buffer[i] for i in idx]
+                td0_update_batch(net, optimizer, batch, gamma=gamma)
 
     # --- Dump eval history to CSV for plotting v1 vs v2 ---
     history_path = os.path.join(
