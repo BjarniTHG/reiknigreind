@@ -9,6 +9,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import time
+import csv
 
 from backgammon import (
     init_board,
@@ -18,13 +20,15 @@ from backgammon import (
 )  # from the professor's backgammon.py
 
 # === Training config for final runs ===
-DEFAULT_TOTAL_EPISODES = 250_000
+DEFAULT_TOTAL_EPISODES = 500_000
 
 E_START = 0.3
 E_END   = 0.01
 
 GAMMA = 0.99
 LR    = 1e-4
+
+MAX_PLIES_PER_GAME = 300
 
 EVAL_INTERVAL   = 5_000      # evaluate vs random every N episodes
 EVAL_NUM_GAMES  = 300        # games per evaluation
@@ -288,6 +292,9 @@ def play_one_selfplay_game(
     move_count = 0
 
     while True:
+        if move_count >= MAX_PLIES_PER_GAME:
+            return 0
+
         if verbose:
             print(f"\n[TURN] player={player}, move_count={move_count}")
 
@@ -356,6 +363,8 @@ def play_game_agent_vs_random(
     move_count = 0
 
     while True:
+        if move_count >= MAX_PLIES_PER_GAME:
+            return 0  # draw / truncated
         if verbose:
             print(f"\n[VS-RAND] player={player}, move_count={move_count}")
 
@@ -389,20 +398,17 @@ def evaluate_vs_random(
     num_games: int = 50,
     epsilon_eval: float = 0.0,
 ) -> float:
-    """
-    Evaluate `net` against the random baseline.
-
-    Returns:
-        win_rate (fraction of games where our agent wins).
-    """
-    wins = 0
+    score = 0.0
     for _ in range(num_games):
         winner = play_game_agent_vs_random(net, epsilon_eval=epsilon_eval, verbose=False)
         if winner == 1:
-            wins += 1
-    win_rate = wins / float(num_games)
+            score += 1.0
+        elif winner == 0:
+            score += 0.5  # draw/truncated
+    win_rate = score / float(num_games)
     print(f"[EVAL] vs random over {num_games} games: win_rate={win_rate:.3f}")
     return win_rate
+
 
 #end of iteration 4, 1
 
@@ -444,6 +450,10 @@ def play_and_train_online_td0_episode(
     move_count = 0
 
     while True:
+        # Hard stop to prevent endless games
+        if move_count >= MAX_PLIES_PER_GAME:
+            # Treat as terminal draw: no winner signal, zero reward
+            return 0, move_count
         if verbose:
             print(f"\n[TD0] player={player}, move_count={move_count}")
 
@@ -774,92 +784,60 @@ def train_td0_conv_main(
     eval_interval: int = EVAL_INTERVAL,
     eval_num_games: int = EVAL_NUM_GAMES,
 ) -> None:
-    """
-    Final TD(0) training loop:
-      - online TD(0) self-play
-      - epsilon annealing
-      - periodic evaluation vs random
-      - periodic checkpointing
-    """
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    eval_csv_path = os.path.join(CHECKPOINT_DIR, f"{BASE_MODEL_NAME}_{run_id}_eval_history.csv")
+    train_csv_path = os.path.join(CHECKPOINT_DIR, f"{BASE_MODEL_NAME}_{run_id}_train_log.csv")
+
+    with open(eval_csv_path, "w", newline="") as f:
+        csv.writer(f).writerow(["episode", "winrate_vs_random"])
+    with open(train_csv_path, "w", newline="") as f:
+        csv.writer(f).writerow(["episode", "epsilon", "lr", "last_winner", "last_moves"])
 
     net = MLPValueNet().to(DEVICE)
     print(f"[INFO] Training model: {net.__class__.__name__}")
     optimizer = optim.Adam(net.parameters(), lr=lr)
 
-    # Optional seed for partial reproducibility
     np.random.seed(42)
     torch.manual_seed(42)
 
     best_random_win = 0.0
-    eval_history: list[tuple[int, float]] = []  # (episode, winrate_vs_random)
 
     for ep in range(1, total_episodes + 1):
-        # Linear epsilon decay
         t = min(1.0, ep / float(total_episodes))
         epsilon = e_start + t * (e_end - e_start)
 
-        # --- Cheap tweak 2: LR schedule ---
-        # Simple LR schedule: decay at 60% and 85% of training
         frac = ep / float(total_episodes)
-        if frac > 0.85:
-            lr_factor = 0.1
-        elif frac > 0.60:
-            lr_factor = 0.3
-        else:
-            lr_factor = 1.0
-
+        lr_factor = 0.1 if frac > 0.85 else (0.3 if frac > 0.60 else 1.0)
         for g in optimizer.param_groups:
             g["lr"] = lr * lr_factor
-        # --- end LR schedule ---
 
-        winner, moves = play_and_train_online_td0_episode(
-            net, optimizer, gamma, epsilon, verbose=False
-        )
+        winner, moves = play_and_train_online_td0_episode(net, optimizer, gamma, epsilon, verbose=False)
 
         if ep % 1000 == 0:
-            print(
-                f"[TRAIN] ep={ep}, epsilon={epsilon:.4f}, "
-                f"lr={optimizer.param_groups[0]['lr']:.6g}, "
-                f"last_winner={winner:+d}, last_moves={moves}"
-            )
+            print(f"[TRAIN] ep={ep}, epsilon={epsilon:.4f}, lr={optimizer.param_groups[0]['lr']:.6g}, "
+                  f"last_winner={winner:+d}, last_moves={moves}")
+            with open(train_csv_path, "a", newline="") as f:
+                csv.writer(f).writerow([ep, float(epsilon), float(optimizer.param_groups[0]["lr"]), int(winner), int(moves)])
 
-        # Periodic evaluation + checkpointing
         if ep % eval_interval == 0:
             print(f"[TRAIN] Evaluating vs random after ep={ep} ({eval_num_games} games, greedy)...")
             win_rate = evaluate_vs_random(net, num_games=eval_num_games, epsilon_eval=0.0)
+            with open(eval_csv_path, "a", newline="") as f:
+                csv.writer(f).writerow([ep, float(win_rate)])
 
-            # Track eval history for plotting later
-            eval_history.append((ep, float(win_rate)))
-
-            # Save checkpoint for this episode
-            ckpt_path = os.path.join(
-                CHECKPOINT_DIR,
-                f"{BASE_MODEL_NAME}_ep{ep}.pt"
-            )
+            ckpt_path = os.path.join(CHECKPOINT_DIR, f"{BASE_MODEL_NAME}_{run_id}_ep{ep}.pt")
             torch.save(net.state_dict(), ckpt_path)
-            print(f"[CKPT] Saved model to {ckpt_path}")
 
-            # Track best vs random
             if win_rate > best_random_win:
                 best_random_win = win_rate
-                best_path = os.path.join(
-                    CHECKPOINT_DIR,
-                    f"{BASE_MODEL_NAME}_best_random.pt"
-                )
+                best_path = os.path.join(CHECKPOINT_DIR, f"{BASE_MODEL_NAME}_{run_id}_best_random.pt")
                 torch.save(net.state_dict(), best_path)
-                print(f"[CKPT] New best vs random={win_rate:.3f}, saved to {best_path}")
 
-    
-    history_path = os.path.join(
-        CHECKPOINT_DIR,
-        f"{BASE_MODEL_NAME}_eval_history.csv"
-    )
-    with open(history_path, "w") as f:
-        f.write("episode,winrate_vs_random\n")
-        for ep_i, wr in eval_history:
-            f.write(f"{ep_i},{wr}\n")
-    print(f"[LOG] Saved eval history to {history_path}")
+    print(f"[LOG] Wrote: {train_csv_path}")
+    print(f"[LOG] Wrote: {eval_csv_path}")
+
 
 #end of iteration 5, 1
 
